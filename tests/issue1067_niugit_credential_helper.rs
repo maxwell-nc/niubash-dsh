@@ -6,8 +6,11 @@
 
 #![cfg(windows)]
 
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+
+use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 
 fn unique_temp_dir(prefix: &str) -> PathBuf {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -145,9 +148,22 @@ fn stage_niu_with_niugit(tag: &str, with_wincred: bool) -> Option<StagedShell> {
     })
 }
 
+/// A hermetic `niu -c` invocation for the staged shell: the host session's
+/// startup environment must not reach the pin. A developer session carries
+/// `BASH_ENV` (the DSH toolchain script), `PROGRAMFILES` next to
+/// `ProgramFiles`, and its own `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_*` — all of
+/// which mutate exactly the variables under test. Same shape as the #1061
+/// pins: `env_clear` + `--norc --noprofile` + explicit system variables.
 fn base_niu_command(stage: &StagedShell, script: &str) -> Command {
     let mut cmd = Command::new(&stage.niu_exe);
-    cmd.arg("-c").arg(script);
+    cmd.args(["--norc", "--noprofile", "-c", script]);
+    cmd.env_clear();
+    cmd.env(
+        "SystemRoot",
+        std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string()),
+    );
+    cmd.env("TEMP", &stage.root);
+    cmd.env("TMP", &stage.root);
     cmd.env("NIU_SKIP_WINUXCMD_ACTIVATION", "1");
     cmd.env("PATH", &stage.empty_dir);
     cmd.env("ProgramFiles", &stage.program_files);
@@ -156,13 +172,9 @@ fn base_niu_command(stage: &StagedShell, script: &str) -> Command {
     cmd.env("USERPROFILE", &stage.empty_dir);
     cmd.env("HOME", &stage.empty_dir);
     cmd.env("GIT_CONFIG_GLOBAL", &stage.gitconfig);
-    cmd.env_remove("WINUXCMD_PATH");
-    cmd.env_remove("GIT_CONFIG_COUNT");
-    cmd.env_remove("GIT_CONFIG_KEY_0");
-    cmd.env_remove("GIT_CONFIG_VALUE_0");
-    cmd.env_remove("GIT_CONFIG_PARAMETERS");
-    cmd.env_remove("GIT_ASKPASS");
-    cmd.env_remove("GIT_CONFIG_NOSYSTEM");
+    // Deterministic non-tty stdin: the B1 gates (GCM_INTERACTIVE, the
+    // missing-helper hint) all key off it.
+    cmd.stdin(Stdio::null());
     cmd
 }
 
@@ -246,19 +258,228 @@ fn scoped_host_helper_does_not_suppress_fallback_helper() {
     assert_eq!(out, "1|credential.helper|wincred");
 }
 
+/// B1 gap (a): a foreign git installation ahead of the bundled dirs that
+/// carries a helper of its own in its system gitconfig keeps it — niu does
+/// not plant a fallback over it.
 #[test]
-fn does_not_seed_when_user_git_is_first_on_path() {
+fn does_not_seed_when_foreign_first_git_configures_its_own_helper() {
     let Some(stage) = stage_niu_with_niugit("niubash-1067-user-git", true) else {
         return;
     };
-    let user_git_dir = stage.root.join("user-git");
-    std::fs::create_dir_all(&user_git_dir).unwrap();
-    std::fs::write(user_git_dir.join("git.exe"), b"user-git").unwrap();
+    let foreign_cmd = stage_foreign_git(&stage, "Git", Some("[credential]\n\thelper = manager\n"));
 
     let mut cmd = base_niu_command(&stage, r#"printf '%s\n' "${GIT_CONFIG_COUNT:-UNSET}""#);
-    cmd.env("PATH", &user_git_dir);
+    cmd.env("PATH", &foreign_cmd);
     let out = run_stdout(&mut cmd);
     assert_eq!(out, "UNSET");
+}
+
+/// B1 gap (a): the common Git-for-Windows-ahead-of-the-bundled-dirs machine
+/// — a foreign git whose installation configures no helper of its own — now
+/// gets the fallback helper planted, instead of the user having to pass
+/// `-c credential.helper=manager` by hand.
+#[test]
+fn seeds_for_foreign_first_git_without_its_own_helper() {
+    let Some(stage) = stage_niu_with_niugit("niubash-b1-foreign-git", true) else {
+        return;
+    };
+    let foreign_cmd = stage_foreign_git(&stage, "Git", None);
+
+    let mut cmd = base_niu_command(
+        &stage,
+        r#"printf '%s|%s|%s\n' "${GIT_CONFIG_COUNT:-}" "${GIT_CONFIG_KEY_0:-}" "${GIT_CONFIG_VALUE_0:-}""#,
+    );
+    cmd.env("PATH", &foreign_cmd);
+    let output = cmd.output().expect("spawn niu");
+    assert!(
+        output.status.success(),
+        "niu failed: srderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let out = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    assert_eq!(out, "1|credential.helper|wincred");
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("no git credential helper"),
+        "a resolved helper must not produce the missing-helper hint; stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// B1 gap (b): a host GCM found on `PATH` is planted under the pinned helper
+/// name `manager` — the same spelling the workaround
+/// `git -c credential.helper=manager` uses.
+#[test]
+fn prefers_pinned_manager_helper_when_gcm_is_on_path() {
+    let Some(stage) = stage_niu_with_niugit("niubash-b1-manager-name", true) else {
+        return;
+    };
+    let foreign_cmd = stage_foreign_git(&stage, "Git", None);
+    std::fs::write(foreign_cmd.join("git-credential-manager.exe"), b"stub-gcm").unwrap();
+
+    let mut cmd = base_niu_command(
+        &stage,
+        r#"printf '%s|%s|%s\n' "${GIT_CONFIG_COUNT:-}" "${GIT_CONFIG_KEY_0:-}" "${GIT_CONFIG_VALUE_0:-}""#,
+    );
+    cmd.env("PATH", &foreign_cmd);
+    let out = run_stdout(&mut cmd);
+    assert_eq!(out, "1|credential.helper|manager");
+}
+
+/// B1 gap (b): non-tty sessions get `GCM_INTERACTIVE=never` so a planted (or
+/// user-configured) GCM cannot try to prompt; an explicit user value wins.
+#[test]
+fn seeds_gcm_interactive_never_for_non_tty_and_keeps_user_value() {
+    let Some(stage) = stage_niu_with_niugit("niubash-b1-gcm-interactive", true) else {
+        return;
+    };
+
+    let mut cmd = base_niu_command(&stage, r#"printf '%s\n' "${GCM_INTERACTIVE:-unset}""#);
+    let out = run_stdout(&mut cmd);
+    assert_eq!(out, "never");
+
+    let mut user_cmd = base_niu_command(&stage, r#"printf '%s\n' "${GCM_INTERACTIVE:-unset}""#);
+    user_cmd.env("GCM_INTERACTIVE", "auto");
+    let out = run_stdout(&mut user_cmd);
+    assert_eq!(
+        out, "auto",
+        "an explicit user value must never be overridden"
+    );
+}
+
+/// B1 gap (c): with no helper resolvable at all, a non-tty session that runs
+/// `git` gets exactly one short stderr hint naming both workarounds.
+#[test]
+fn hint_fires_once_when_no_helper_resolves_noninteractively() {
+    let Some(stage) = stage_niu_with_niugit("niubash-b1-hint", false) else {
+        return;
+    };
+    let mut cmd = base_niu_command(&stage, "git --version");
+    let output = cmd.output().expect("spawn niu");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("no git credential helper"),
+        "expected the missing-helper hint, stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("git -c credential.helper=manager"),
+        "hint must name the -c workaround, stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("NIU_USER_PATH_FIRST=1"),
+        "hint must name the PATH switch, stderr={stderr}"
+    );
+    assert_eq!(
+        stderr.matches("no git credential helper").count(),
+        1,
+        "the hint must appear at most once per process, stderr={stderr}"
+    );
+}
+
+/// B1 gap (c): the hint stays out of sessions that never run `git`, and out
+/// of tty sessions (which can still be prompted).
+#[test]
+fn hint_is_absent_for_non_git_command_and_in_tty_session() {
+    let Some(stage) = stage_niu_with_niugit("niubash-b1-hint-gates", false) else {
+        return;
+    };
+
+    let mut quiet = base_niu_command(&stage, "echo hello");
+    let output = quiet.output().expect("spawn niu");
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("no git credential helper"),
+        "a session that never runs git must stay quiet, stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Same stage under a pseudo-terminal: stdin is a tty, so no hint.
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("open pty");
+    let mut builder = CommandBuilder::new(&stage.niu_exe);
+    builder.env_clear();
+    if let Ok(system_root) = std::env::var("SystemRoot") {
+        builder.env("SystemRoot", system_root);
+    }
+    builder.env("TEMP", stage.root.display().to_string());
+    builder.env("TMP", stage.root.display().to_string());
+    builder.env("NIU_SKIP_WINUXCMD_ACTIVATION", "1");
+    builder.env("PATH", stage.empty_dir.display().to_string());
+    builder.env("ProgramFiles", stage.program_files.display().to_string());
+    builder.env("ProgramFiles(x86)", stage.empty_dir.display().to_string());
+    builder.env("LOCALAPPDATA", stage.empty_dir.display().to_string());
+    builder.env("USERPROFILE", stage.empty_dir.display().to_string());
+    builder.env("HOME", stage.empty_dir.display().to_string());
+    builder.env("GIT_CONFIG_GLOBAL", stage.gitconfig.display().to_string());
+    builder.env("NIU_LANG", "en");
+    builder.env("TERM", "xterm");
+    builder.args(["--norc", "--noprofile", "-c", "git --version"]);
+
+    let mut child = pair.slave.spawn_command(builder).expect("spawn niu in pty");
+    drop(pair.slave);
+    let mut writer = pair.master.take_writer().expect("take pty writer");
+    let mut reader = pair.master.try_clone_reader().expect("clone pty reader");
+    let collected = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let collected_bg = std::sync::Arc::clone(&collected);
+    let _pump = std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        while let Ok(n) = reader.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            let chunk = &buf[..n];
+            // The #1061 pty pin's rule: a startup cursor-position query must
+            // be answered or the child waits on the terminal forever.
+            if chunk.windows(4).any(|w| w == b"\x1b[6n") {
+                let _ = writer.write_all(b"\x1b[1;1R");
+                let _ = writer.flush();
+            }
+            collected_bg.lock().unwrap().extend_from_slice(chunk);
+        }
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        if child.try_wait().expect("poll pty child").is_some() {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("pty child hung");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    // Mirror the #1061 pty pin: give the pump a moment, close the master end
+    // so the reader sees EOF, and never join it (a ConPTY reader can outlive
+    // the child; the test process ends right after).
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    drop(pair.master);
+    let output = String::from_utf8_lossy(&collected.lock().unwrap()).into_owned();
+    assert!(
+        !output.contains("no git credential helper"),
+        "a tty session must not be hinted, output={output:?}"
+    );
+}
+
+/// A Git-for-Windows-shaped foreign installation: `<dir>\cmd\git.exe`, with
+/// an optional system gitconfig at `<dir>\etc\gitconfig`. Returns the `cmd`
+/// directory to put on `PATH`.
+fn stage_foreign_git(stage: &StagedShell, name: &str, system_config: Option<&str>) -> PathBuf {
+    let root = stage.program_files.join(name);
+    let cmd_dir = root.join("cmd");
+    std::fs::create_dir_all(&cmd_dir).unwrap();
+    std::fs::write(cmd_dir.join("git.exe"), b"user-git").unwrap();
+    if let Some(config) = system_config {
+        let etc = root.join("etc");
+        std::fs::create_dir_all(&etc).unwrap();
+        std::fs::write(etc.join("gitconfig"), config).unwrap();
+    }
+    cmd_dir
 }
 
 #[test]

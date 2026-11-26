@@ -114,9 +114,15 @@ pub fn suppressed_command(program: impl AsRef<std::ffi::OsStr>) -> std::process:
     command
 }
 
-/// niubash#462: claim the first child's hidden `CREATE_NO_WINDOW` console for
-/// the host session so subsequent external spawns inherit it for free instead
-/// of paying ~22 ms per child spawn.
+/// niubash#462, narrowed by the G2 adoption-risk ruling: claim a child's
+/// hidden console for the host session so subsequent external spawns inherit
+/// it for free instead of paying ~22 ms per child spawn — but only when that
+/// console is one THIS process allocated itself (`try_alloc_hidden_console`,
+/// reached through [`suppress_orphan_console`]). A child that was given
+/// `CREATE_NO_WINDOW` auto-created its own console; attaching niu to it would
+/// leave niu on a foreign console that dies with the child, with no
+/// [`release_orphan_console`] able to fire. That case is now a no-op: the
+/// next spawn pays the flag again, which is the safe direction.
 pub fn adopt_orphan_console(child_pid: u32) {
     platform::adopt_orphan_console(child_pid);
 }
@@ -138,6 +144,26 @@ mod platform {
     use windows_sys::Win32::UI::WindowsAndMessaging::IsWindowVisible;
 
     const UTF8_CODE_PAGE: u32 = 65001;
+
+    /// G2: set once [`try_alloc_hidden_console`] has attached a hidden console
+    /// this process allocated itself. It is the only console
+    /// [`adopt_orphan_console`] may ever claim: a console a child
+    /// auto-created under `CREATE_NO_WINDOW` is the child's, and attaching to
+    /// it leaves niu on a dying, foreign console that
+    /// [`release_orphan_console`] cannot free.
+    static HIDDEN_CONSOLE_ALLOCATED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    /// The G2 adoption decision, in one place: a console this process
+    /// allocated itself may be adopted, one a child created may not, and a
+    /// console already attached is nothing to adopt.
+    fn console_adoption_allowed(self_allocated: bool, already_attached: bool) -> bool {
+        self_allocated && !already_attached
+    }
+
+    fn hidden_console_allocated_here() -> bool {
+        HIDDEN_CONSOLE_ALLOCATED.load(std::sync::atomic::Ordering::SeqCst)
+    }
 
     pub fn capture() -> ConsoleBaseline {
         ConsoleBaseline {
@@ -330,7 +356,7 @@ mod platform {
                 return false;
             }
             let func: AllocConsoleWithOptionsFn = core::mem::transmute(proc);
-            preserve_std_handles(|| {
+            let allocated = preserve_std_handles(|| {
                 let options = AllocConsoleOptions {
                     mode: ALLOC_CONSOLE_MODE_NO_WINDOW,
                     use_show_window: 0,
@@ -338,15 +364,27 @@ mod platform {
                 };
                 let mut result = 0i32;
                 func(&options, &mut result) >= 0 && GetConsoleCP() != 0
-            })
+            });
+            if allocated {
+                // G2: this console is ours; only it may later be adopted.
+                HIDDEN_CONSOLE_ALLOCATED.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            allocated
         }
     }
 
     pub fn adopt_orphan_console(child_pid: u32) {
+        // G2: a console this process did not allocate itself is never
+        // adopted. `CREATE_NO_WINDOW` consoles belong to the child that
+        // auto-created them; attaching would strand niu on a dying console
+        // `release_orphan_console` refuses to free. When we DID allocate one
+        // we are already attached to it, so the gate below also covers the
+        // historical early return (`GetConsoleCP() != 0`).
+        let already_attached = unsafe { GetConsoleCP() } != 0;
+        if !console_adoption_allowed(hidden_console_allocated_here(), already_attached) {
+            return;
+        }
         unsafe {
-            if GetConsoleCP() != 0 {
-                return;
-            }
             const ERROR_INVALID_HANDLE: u32 = 6;
             const ERROR_GEN_FAILURE: u32 = 31;
             preserve_std_handles(|| {
@@ -468,6 +506,51 @@ mod platform {
                 unsafe { GetStdHandle(STD_OUTPUT_HANDLE) },
                 before,
                 "a failed guarded call must not leave std handles swapped"
+            );
+        }
+
+        /// G2 (console adoption risk): a console a child auto-created under
+        /// `CREATE_NO_WINDOW` is never adopted, while one this process
+        /// allocated itself stays eligible; an already-attached console is
+        /// nothing to adopt either way.
+        #[test]
+        fn g2_adopts_only_a_console_this_process_allocated() {
+            assert!(
+                !console_adoption_allowed(false, false),
+                "a child-created hidden console must never be adopted"
+            );
+            assert!(
+                console_adoption_allowed(true, false),
+                "a self-allocated hidden console stays admissible"
+            );
+            assert!(
+                !console_adoption_allowed(true, true),
+                "an already-attached console is not adopted again"
+            );
+            assert!(
+                !console_adoption_allowed(false, true),
+                "an attached foreign console is never adopted"
+            );
+        }
+
+        /// G2: while this test process owns a console, nothing can have set
+        /// the self-allocation flag — `suppress_orphan_console` only reaches
+        /// `try_alloc_hidden_console` when `GetConsoleCP() == 0` — so the gate
+        /// provably starts from "not ours" and refuses adoption. A
+        /// console-less test host (ConPTY/detached runner) cannot make that
+        /// observation and skips instead of guessing.
+        #[test]
+        fn g2_adoption_flag_stays_unset_while_this_process_has_a_console() {
+            if unsafe { GetConsoleCP() } == 0 {
+                return;
+            }
+            assert!(
+                !hidden_console_allocated_here(),
+                "the self-allocation flag must be unset while a console is inherited"
+            );
+            assert!(
+                !console_adoption_allowed(hidden_console_allocated_here(), false),
+                "a console this process never allocated must not be adopted"
             );
         }
     }

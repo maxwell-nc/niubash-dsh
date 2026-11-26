@@ -30,9 +30,24 @@
 //!
 //! `finish` drains before process exit: it closes niu's pipe-write handle so
 //! the pump reads EOF, then joins it, so normal runs never lose output. The
-//! post-execution exit funnels route through `finish_and_exit`; a blocking
-//! drain at that point matches GNU (`bash -c 'seq 1000000' | slow-reader`
-//! waits for the pipe just like the pre-change niu blocked in write).
+//! post-execution exit funnels route through `finish_and_exit`; a drain that
+//! keeps making progress at that point matches GNU (`bash -c 'seq 1000000' |
+//! slow-reader` waits for the pipe just like the pre-change niu blocked in
+//! write).
+//!
+//! The drain is bounded against a writer the shell no longer controls. A
+//! daemon a script started (`cmd /c start /b …`, `adb start-server`, any
+//! grandchild that survives its parent) inherits the wrapper's write end, so
+//! the pump would never read EOF and niu would never exit — the host harness
+//! then sees the tool call run until its own timeout, and every later call
+//! inherits the same wedge. `finish` therefore abandons a pump that has been
+//! IDLE — blocked in its read with no bytes moving — for `DRAIN_IDLE_GRACE`.
+//! A pump blocked in a downstream write is a live-but-slow reader, not a
+//! leak, and keeps waiting, so backpressure semantics are unchanged.
+//! `NIU_STDOUT_DRAIN_GRACE_MS` overrides the bound; `0` restores the old
+//! unbounded wait, and `NIU_PUMP_DEBUG=1` narrates the drain decision on
+//! stderr (the diagnostic that separates "the drain let go" from "something
+//! else held the process").
 //!
 //! The wrapper is never installed for the interactive REPL (console stdout —
 //! a console cannot break), the launcher word paths (`--version`/`--help`
@@ -143,8 +158,10 @@ mod imp {
     use std::fs::File;
     use std::io::{self, Read, Write};
     use std::os::windows::io::{FromRawHandle, RawHandle};
-    use std::sync::mpsc::{self, Receiver, Sender};
-    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+    use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
 
     use windows_sys::Win32::Foundation::{
         CloseHandle, SetHandleInformation, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE,
@@ -161,6 +178,38 @@ mod imp {
     const PIPE_BUFFER_BYTES: u32 = 1024 * 1024;
     /// Pump read chunk.
     const PUMP_CHUNK_BYTES: usize = 64 * 1024;
+    /// How long `finish` tolerates an IDLE pump — blocked in its read with no
+    /// bytes moving and no EOF — before giving up on the writers still
+    /// holding the wrapper pipe. A daemon a script started keeps that pipe
+    /// open long after the shell is done, and without a bound the drain would
+    /// never return: niu would hang until the host's own timeout on every
+    /// such call. `NIU_STDOUT_DRAIN_GRACE_MS` overrides it; `0` restores the
+    /// unbounded drain.
+    const DRAIN_IDLE_GRACE: Duration = Duration::from_millis(2_000);
+    /// Poll slice for the bounded drain: small enough to notice progress
+    /// promptly, large enough not to spin.
+    const DRAIN_POLL: Duration = Duration::from_millis(50);
+    /// Pump phase while it waits for the next wrapper-pipe chunk.
+    const PUMP_READING: u8 = 0;
+    /// Pump phase while a downstream write is in flight. That is a live (if
+    /// slow) reader — backpressure — so the bounded drain keeps waiting.
+    const PUMP_WRITING: u8 = 1;
+
+    /// Telemetry the pump publishes for the bounded drain: how many bytes it
+    /// has forwarded, and whether it is currently reading or writing.
+    struct PumpProgress {
+        bytes: AtomicU64,
+        phase: AtomicU8,
+    }
+
+    impl PumpProgress {
+        fn new() -> Self {
+            Self {
+                bytes: AtomicU64::new(0),
+                phase: AtomicU8::new(PUMP_READING),
+            }
+        }
+    }
 
     struct PumpState {
         /// niu's retained copy of the wrapper pipe write end — the handle
@@ -169,6 +218,8 @@ mod imp {
         write_handle: isize,
         /// Signaled by the pump after it forwarded everything (EOF).
         done: Receiver<()>,
+        /// Liveness the bounded drain reads while it waits for `done`.
+        progress: Arc<PumpProgress>,
     }
 
     static PUMP: Mutex<Option<PumpState>> = Mutex::new(None);
@@ -214,14 +265,25 @@ mod imp {
             let (done_sender, done_receiver) = mpsc::channel::<()>();
             let read_file = std::mem::ManuallyDrop::new(File::from_raw_handle(read_end));
             let real_handle = real as isize;
+            let progress = Arc::new(PumpProgress::new());
+            let pump_progress = Arc::clone(&progress);
             let spawned = std::thread::Builder::new()
                 .name("niu-stdout-pump".to_string())
-                .spawn(move || pump_loop(read_file, real_handle, done_sender, respawned_child));
+                .spawn(move || {
+                    pump_loop(
+                        read_file,
+                        real_handle,
+                        done_sender,
+                        respawned_child,
+                        pump_progress,
+                    )
+                });
             match spawned {
                 Ok(_join) => {
                     *PUMP.lock().expect("pump state mutex") = Some(PumpState {
                         write_handle: write_end as isize,
                         done: done_receiver,
+                        progress,
                     });
                 }
                 Err(_) => {
@@ -247,25 +309,30 @@ mod imp {
         real_handle: isize,
         done: Sender<()>,
         respawned_child: bool,
+        progress: Arc<PumpProgress>,
     ) {
         let mut real: std::mem::ManuallyDrop<File> =
             unsafe { std::mem::ManuallyDrop::new(File::from_raw_handle(real_handle as RawHandle)) };
         let mut buffer = vec![0_u8; PUMP_CHUNK_BYTES];
         loop {
+            progress.phase.store(PUMP_READING, Ordering::Relaxed);
             match read.read(&mut buffer) {
                 Ok(0) => break, // EOF: every writer closed — fully drained
                 Ok(size) => {
+                    progress.phase.store(PUMP_WRITING, Ordering::Relaxed);
                     if write_all(&mut real, &buffer[..size]).is_err() {
                         if respawned_child {
                             std::process::exit(RESPAWNED_BROKEN_PIPE_EXIT_CODE);
                         }
                         report_and_exit();
                     }
+                    progress.bytes.fetch_add(size as u64, Ordering::Relaxed);
                 }
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                 Err(_) => break,
             }
         }
+        progress.phase.store(PUMP_READING, Ordering::Relaxed);
         let _ = done.send(());
     }
 
@@ -303,14 +370,71 @@ mod imp {
     /// exits the process first.
     pub fn finish() {
         let Some(state) = PUMP.lock().ok().and_then(|mut slot| slot.take()) else {
+            if std::env::var_os("NIU_PUMP_DEBUG").is_some() {
+                eprintln!("niu-pump: finish with no pump");
+            }
             return;
         };
         unsafe {
             CloseHandle(state.write_handle as Handle);
         }
-        // Err means the pump thread is already gone (it exited the process
-        // via the broken-write path); either way there is nothing to await.
-        let _ = state.done.recv();
+        let debug = std::env::var_os("NIU_PUMP_DEBUG").is_some();
+        // A pump that already exited (broken downstream write) dropped its
+        // sender, so a disconnected channel is the normal fast path.
+        let grace = drain_idle_grace();
+        let mut forwarded = state.progress.bytes.load(Ordering::Relaxed);
+        let mut idle_since = Instant::now();
+        loop {
+            match state.done.recv_timeout(DRAIN_POLL) {
+                Ok(()) | Err(RecvTimeoutError::Disconnected) => {
+                    if debug {
+                        eprintln!("niu-pump: drained after {:?}", idle_since.elapsed());
+                    }
+                    return;
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+            }
+            if grace.is_zero() {
+                // Legacy unbounded drain: wait for EOF, whatever holds it.
+                continue;
+            }
+            let now = state.progress.bytes.load(Ordering::Relaxed);
+            if now != forwarded {
+                forwarded = now;
+                idle_since = Instant::now();
+            } else if state.progress.phase.load(Ordering::Relaxed) == PUMP_WRITING {
+                // The pump is inside a downstream write, so the reader is
+                // alive but slow: GNU waits on backpressure too.
+                idle_since = Instant::now();
+            } else if idle_since.elapsed() >= grace {
+                if debug {
+                    eprintln!(
+                        "niu-pump: abandoned idle pump after {:?}",
+                        idle_since.elapsed()
+                    );
+                }
+                // Some writer we do not control — a daemon the script
+                // started, or any surviving grandchild — still holds the
+                // wrapper pipe open, and nothing has moved for the whole
+                // grace. Everything forwarded so far is intact; output that
+                // writer produces after this point is dropped, and the
+                // harness gets its EOF instead of hanging.
+                return;
+            }
+        }
+    }
+
+    /// Idle bound for the drain: `NIU_STDOUT_DRAIN_GRACE_MS` (milliseconds),
+    /// `0` for the unbounded pre-fix wait, invalid values for the default.
+    fn drain_idle_grace() -> Duration {
+        match std::env::var("NIU_STDOUT_DRAIN_GRACE_MS") {
+            Ok(raw) => raw
+                .trim()
+                .parse::<u64>()
+                .map(Duration::from_millis)
+                .unwrap_or(DRAIN_IDLE_GRACE),
+            Err(_) => DRAIN_IDLE_GRACE,
+        }
     }
 }
 

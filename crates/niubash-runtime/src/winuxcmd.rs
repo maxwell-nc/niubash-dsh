@@ -474,22 +474,27 @@ fn user_path_first() -> bool {
         .unwrap_or(false)
 }
 
-/// Seed a fallback `credential.helper` via `GIT_CONFIG_COUNT` when bundled
-/// `niu-git` is the active `git` and the user has not configured one
-/// (`niubash#1067`).
+/// Seed a fallback `credential.helper` via `GIT_CONFIG_COUNT` when the
+/// session runs a `git` that has no credential helper of its own
+/// (`niubash#1067`, B1 gap (a)).
 ///
 /// Precedence & safety:
 /// - Skips when the first `git` on the PATH the session inherited is a
-///   foreign one (see `credential_seed_allowed`): a user git ahead of
-///   the bundled dirs already carries its own `etc/gitconfig` and
-///   helper. The verdict is read off the inherited PATH — captured
-///   before niu's own injection rewrote it — not off the post-injection
-///   PATH: under the `#1050` bundled-first default the injected dirs
-///   always lead, so a post-injection scan could never see the user's
-///   git first and the skip could never fire (niubash#1100). The scan
-///   stays correct under the bundled-first default and under the
-///   `NIU_USER_PATH_FIRST` escape alike, because both leave the
-///   inherited order the user presented untouched.
+///   foreign installation that evidently configures a helper of its own (an
+///   un-scoped `[credential] helper` in its `etc/gitconfig`); that git
+///   already supplies one, and the seeded entry would be asked first. Every
+///   other verdict allows the seed: a foreign first git with no helper of
+///   its own — the common Git-for-Windows-ahead-of-the-bundled-dirs case
+///   that used to force users to pass `-c credential.helper=manager` by hand
+///   — a bundled first git (a nested session), and no git at all (the
+///   bundled git niu injects is about to be the only one). The verdict is
+///   read off the inherited PATH — captured before niu's own injection
+///   rewrote it — not off the post-injection PATH: under the `#1050`
+///   bundled-first default the injected dirs always lead, so a
+///   post-injection scan could never see the user's git first (niubash#1100).
+/// - Skips when the bundled tree holds no git, except when the first git is
+///   the foreign one: there the seed exists exactly for a git niu did not
+///   bundle.
 /// - Skips when `GIT_ASKPASS`, `GIT_CONFIG_NOSYSTEM`, or
 ///   `GIT_CONFIG_GLOBAL=NUL|/dev/null` is set, or when `GIT_CONFIG_PARAMETERS`
 ///   or `GIT_CONFIG_COUNT` already sets `credential.helper`.
@@ -500,12 +505,18 @@ fn user_path_first() -> bool {
 ///   suppress the fallback for other hosts.
 /// - Prefers host `git-credential-manager.exe` (or legacy
 ///   `git-credential-manager-core.exe`) on `PATH` or in standard Windows
-///   install paths, falling back to bundled `wincred` when present.
+///   install paths, falling back to bundled `wincred` when present. A host
+///   GCM found on `PATH` is planted under the pinned helper name `manager`,
+///   the same spelling `git -c credential.helper=manager` uses (B1 gap (b));
+///   one found only in its install directory is planted as the absolute
+///   command, which needs no name resolution.
+///
+/// A non-interactive session additionally gets `GCM_INTERACTIVE=never`, and
+/// a session where no helper resolves at all gets one short stderr hint.
 #[cfg(windows)]
 fn seed_niugit_credential_helper(root: &Path, exe: &Path, inherited_path: &str) {
-    if !has_bundled_niugit(root)
-        || !credential_seed_allowed_on_inherited_path(root, exe, inherited_path)
-    {
+    seed_gcm_noninteractive_env();
+    if !credential_seed_allowed_on_inherited_path(root, exe, inherited_path) {
         return;
     }
     if env_blocks_credential_helper_seeding() {
@@ -515,6 +526,7 @@ fn seed_niugit_credential_helper(root: &Path, exe: &Path, inherited_path: &str) 
         return;
     }
     let Some(helper) = resolve_niugit_credential_helper(root) else {
+        hint_missing_credential_helper();
         return;
     };
     let existing_count = match std::env::var("GIT_CONFIG_COUNT") {
@@ -533,6 +545,138 @@ fn seed_niugit_credential_helper(root: &Path, exe: &Path, inherited_path: &str) 
     log::debug!("seeded niu-git fallback credential.helper={helper} (niubash#1067)");
 }
 
+/// B1 gap (b): a session whose stdin is not a terminal can never answer an
+/// interactive GCM prompt, so a planted — or user-configured — GCM must fail
+/// fast instead of trying. `GCM_INTERACTIVE=never` is seeded only when the
+/// variable is unset: an explicit user value (`auto`, `always`, `never`, …)
+/// always wins. Mirrors the non-tty `GIT_TERMINAL_PROMPT=0` seed in
+/// `shell.rs`.
+#[cfg(windows)]
+fn seed_gcm_noninteractive_env() {
+    if crate::terminal::stdin_is_terminal() {
+        return;
+    }
+    if std::env::var_os("GCM_INTERACTIVE").is_some() {
+        return;
+    }
+    std::env::set_var("GCM_INTERACTIVE", "never");
+    log::debug!("seeded GCM_INTERACTIVE=never for a non-interactive session (B1)");
+}
+
+/// B1 gap (c): the one-line workaround hint, at most once per process.
+const CREDENTIAL_HELPER_HINT: &str = "niu: no git credential helper; use `git -c credential.helper=manager` or set NIU_USER_PATH_FIRST=1 to use your own git";
+
+/// Once-per-process latch for [`CREDENTIAL_HELPER_HINT`]; the same shape as
+/// `git_prompt_cache::SCRATCH_FAILURE_WARNED` (niubash#852).
+static CREDENTIAL_HELPER_HINTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the hint may print: only in a session that cannot answer a
+/// terminal prompt (non-tty stdin) and that is actually going to run `git`.
+#[cfg(any(windows, test))]
+fn credential_hint_enabled(stdin_is_tty: bool, runs_git: bool) -> bool {
+    !stdin_is_tty && runs_git
+}
+
+/// Take the once-per-process latch; `true` the first time only.
+#[cfg(any(windows, test))]
+fn take_hint_latch(latch: &std::sync::atomic::AtomicBool) -> bool {
+    !latch.swap(true, std::sync::atomic::Ordering::SeqCst)
+}
+
+/// B1 gap (c): when no credential helper can be resolved at all, say so once —
+/// a silent session leaves the user with an unexplained auth failure. The
+/// gates that keep it out of query faces and out of sessions that never touch
+/// git are in [`invocation_runs_git`]; the latch keeps it to one line per
+/// process.
+#[cfg(windows)]
+fn hint_missing_credential_helper() {
+    if !credential_hint_enabled(crate::terminal::stdin_is_terminal(), invocation_runs_git()) {
+        return;
+    }
+    if !take_hint_latch(&CREDENTIAL_HELPER_HINTED) {
+        return;
+    }
+    eprintln!("{CREDENTIAL_HELPER_HINT}");
+}
+
+/// B1 gap (c): whether a `git` command is actually being invoked, judged from
+/// this process's command line — the runtime has no executor hook to observe
+/// a real git spawn from here. A query face (`--version`, `--help`,
+/// completion probe) never runs a command; otherwise the `-c`/`--ec` payloads
+/// and any script-file operand are scanned for a command segment whose first
+/// word is a `git` executable.
+#[cfg(any(windows, test))]
+fn invocation_runs_git() -> bool {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    invocation_args_run_git(&args)
+}
+
+/// The pure half of [`invocation_runs_git`].
+#[cfg(any(windows, test))]
+fn invocation_args_run_git(args: &[String]) -> bool {
+    if args.iter().any(|arg| is_command_query_face(arg)) {
+        return false;
+    }
+    args.iter().any(|arg| {
+        command_line_runs_git(arg)
+            || (looks_like_script_operand(arg)
+                && std::fs::read_to_string(arg).is_ok_and(|text| command_line_runs_git(&text)))
+    })
+}
+
+/// A face that answers from its arguments and never executes a command.
+#[cfg(any(windows, test))]
+fn is_command_query_face(arg: &str) -> bool {
+    matches!(
+        arg,
+        "-h" | "--help" | "-V" | "--version" | "--completion-probe"
+    )
+}
+
+/// A bare operand naming an existing, reasonably sized file — the
+/// `niu script.sh` shape.
+#[cfg(any(windows, test))]
+fn looks_like_script_operand(arg: &str) -> bool {
+    const SCRIPT_SCAN_CAP: u64 = 256 * 1024;
+    !arg.starts_with('-')
+        && std::fs::metadata(arg).is_ok_and(|meta| meta.is_file() && meta.len() <= SCRIPT_SCAN_CAP)
+}
+
+/// Whether any command segment of a shell command line starts with a `git`
+/// executable. Segments split on the usual separators so `echo git` does not
+/// count while `cd x && git pull` does.
+#[cfg(any(windows, test))]
+fn command_line_runs_git(text: &str) -> bool {
+    text.split(|c: char| matches!(c, ';' | '\n' | '|' | '&' | '(' | ')' | '`'))
+        .any(|segment| word_is_git_command(first_command_word(segment)))
+}
+
+/// The word heading one command segment: a quoted word is read to its
+/// closing quote (a git path with spaces), otherwise the first whitespace run.
+#[cfg(any(windows, test))]
+fn first_command_word(segment: &str) -> &str {
+    let trimmed = segment.trim_start();
+    match trimmed.chars().next() {
+        Some(quote @ ('"' | '\'')) => trimmed[1..].find(quote).map_or_else(
+            || trimmed.trim_start_matches(quote),
+            |end| &trimmed[1..=end],
+        ),
+        _ => trimmed.split_whitespace().next().unwrap_or_default(),
+    }
+}
+
+/// Whether a command word names a `git` executable (`git`, `git.exe`, or a
+/// path ending in either).
+#[cfg(any(windows, test))]
+fn word_is_git_command(word: &str) -> bool {
+    let word = word.trim_matches(['{', '}']);
+    Path::new(word)
+        .file_name()
+        .map(|name| name.to_string_lossy().to_ascii_lowercase())
+        .is_some_and(|name| name == "git" || name == "git.exe")
+}
+
 /// Which git an ordered PATH scan meets first, if any.
 #[cfg(any(windows, test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -547,9 +691,10 @@ enum FirstGitVerdict {
 }
 
 /// First-hit scan over the PATH entries, walked in order; the first
-/// entry holding a git decides the verdict.
+/// entry holding a git decides the verdict, and its directory is returned
+/// alongside so callers can inspect that installation.
 #[cfg(any(windows, test))]
-fn first_git_verdict(entries: &[&str], bundled_dirs: &[PathBuf]) -> FirstGitVerdict {
+fn first_git_hit(entries: &[&str], bundled_dirs: &[PathBuf]) -> (FirstGitVerdict, Option<PathBuf>) {
     let git_name = if cfg!(windows) { "git.exe" } else { "git" };
     for entry in entries {
         let entry = entry.trim();
@@ -565,14 +710,26 @@ fn first_git_verdict(entries: &[&str], bundled_dirs: &[PathBuf]) -> FirstGitVerd
                     && (entry_cmp == ancestor_cmp
                         || entry_cmp.starts_with(&format!("{ancestor_cmp}/")))
             });
-            return if in_bundled {
+            let verdict = if in_bundled {
                 FirstGitVerdict::Bundled
             } else {
                 FirstGitVerdict::Foreign
             };
+            return (verdict, Some(dir));
         }
     }
-    FirstGitVerdict::Absent
+    (FirstGitVerdict::Absent, None)
+}
+
+/// First-hit scan over the PATH entries, walked in order; the first
+/// entry holding a git decides the verdict. Production judges through
+/// [`first_git_hit`]; this projection survives only as the surface the
+/// `#1067`/`#1100` lib pins assert against, so it is test-only — widening
+/// its cfg back to `any(windows, test)` makes it dead code in the
+/// production build.
+#[cfg(test)]
+fn first_git_verdict(entries: &[&str], bundled_dirs: &[PathBuf]) -> FirstGitVerdict {
+    first_git_hit(entries, bundled_dirs).0
 }
 
 /// `true` when the first git on the scanned entries is the bundled one;
@@ -589,14 +746,51 @@ fn first_git_dir_is_bundled(entries: &[&str], bundled_dirs: &[PathBuf]) -> bool 
 
 /// Whether the `#1067` credential seed may be planted, judged on the
 /// PATH entries of the PATH the session inherited — before niu's own
-/// injection rewrote it (niubash#1100). Only a foreign first git
-/// vetoes the seed: it is the user's git, with its own `etc/gitconfig`
-/// and helper. A bundled first git (a nested session that inherited
-/// the bundled dirs) and no git at all (the bundled git niu injects is
-/// about to be the only one) both allow it.
+/// injection rewrote it (niubash#1100). A foreign first git no longer vetoes
+/// the seed by itself (B1 gap (a)): it vetoes only when that installation
+/// evidently carries a credential helper of its own
+/// (`foreign_git_configures_credential_helper`) — the common
+/// Git-for-Windows-first machine has no helper there for the git niu runs,
+/// so planting the fallback is exactly the fix. A bundled first git (a
+/// nested session that inherited the bundled dirs) and no git at all (the
+/// bundled git niu injects is about to be the only one) both allow it.
+/// `has_bundled_git` gates the non-foreign cases only.
 #[cfg(any(windows, test))]
-fn credential_seed_allowed(entries: &[&str], bundled_dirs: &[PathBuf]) -> bool {
-    first_git_verdict(entries, bundled_dirs) != FirstGitVerdict::Foreign
+fn credential_seed_allowed(
+    entries: &[&str],
+    bundled_dirs: &[PathBuf],
+    has_bundled_git: bool,
+) -> bool {
+    match first_git_hit(entries, bundled_dirs) {
+        (FirstGitVerdict::Foreign, Some(dir)) => !foreign_git_configures_credential_helper(&dir),
+        (FirstGitVerdict::Foreign, None) => true,
+        _ => has_bundled_git,
+    }
+}
+
+/// B1 gap (a): whether a foreign git installation evidently brings its own
+/// credential helper — its system gitconfig (`<install>\etc\gitconfig`, the
+/// Git-for-Windows layout) configures an un-scoped `[credential] helper`.
+/// The scan climbs from the directory holding `git.exe` through its
+/// ancestors, because that directory is `cmd`, `mingw64\bin`, `usr\bin` or
+/// `bin` depending on the install. Scoped helpers (`[credential
+/// "https://github.com"]`) do not count, matching the global-config rule.
+#[cfg(any(windows, test))]
+fn foreign_git_configures_credential_helper(git_dir: &Path) -> bool {
+    let mut cursor = Some(git_dir);
+    for _ in 0..4 {
+        let Some(dir) = cursor else {
+            break;
+        };
+        let candidate = dir.join("etc").join("gitconfig");
+        if std::fs::read_to_string(&candidate)
+            .is_ok_and(|contents| gitconfig_has_unscoped_credential_helper(&contents))
+        {
+            return true;
+        }
+        cursor = dir.parent();
+    }
+    false
 }
 
 /// The seed gate for one session: the bundled dirs of the selected
@@ -612,7 +806,7 @@ fn credential_seed_allowed_on_inherited_path(
         bundled_dirs.extend(injected_path_dirs(&links_root, exe));
     }
     let entries: Vec<&str> = inherited_path.split(path_list_separator()).collect();
-    credential_seed_allowed(&entries, &bundled_dirs)
+    credential_seed_allowed(&entries, &bundled_dirs, has_bundled_niugit(root))
 }
 
 #[cfg(windows)]
@@ -740,7 +934,7 @@ fn format_git_credential_helper_command(exe_path: &Path) -> String {
 #[cfg(windows)]
 fn resolve_niugit_credential_helper(root: &Path) -> Option<String> {
     if let Some(gcm) = find_host_gcm_executable() {
-        return Some(format_git_credential_helper_command(&gcm));
+        return Some(host_gcm_helper_value(&gcm));
     }
     let bundled_wincred = root
         .join("opt")
@@ -753,6 +947,22 @@ fn resolve_niugit_credential_helper(root: &Path) -> Option<String> {
         return Some("wincred".to_string());
     }
     None
+}
+
+/// B1 gap (b): the `credential.helper` value for a resolved host GCM. A GCM
+/// on `PATH` is planted under the pinned name `manager` — the same spelling
+/// the workaround hint (`git -c credential.helper=manager`) and GCM's own
+/// installer use — because a bare-name lookup then resolves it for the
+/// bundled and a foreign git alike. A GCM found only in its standard install
+/// directory is not on the `PATH` the running git searches, so it is planted
+/// as the absolute command form instead.
+#[cfg(windows)]
+fn host_gcm_helper_value(gcm: &Path) -> String {
+    if find_file_in_path_dirs("git-credential-manager.exe").is_some() {
+        "manager".to_string()
+    } else {
+        format_git_credential_helper_command(gcm)
+    }
 }
 
 #[cfg(windows)]
@@ -2855,23 +3065,18 @@ mod path_order_tests {
         );
     }
 
-    /// niubash#1100: the credential seed's gate judges the PATH the
-    /// session inherited, and only a foreign first git vetoes the
-    /// seed — the host-failing shape is an inherited PATH whose only
-    /// git is the user's. A bundled first git (nested session) and no
-    /// git at all (the bundled git is about to be the only one) both
-    /// allow the seed.
+    /// niubash#1100 + B1 gap (a): the credential seed's gate judges the PATH
+    /// the session inherited. A foreign first git no longer vetoes by itself:
+    /// it vetoes only when its own `etc/gitconfig` configures an un-scoped
+    /// credential helper. A bundled first git (nested session) and no git at
+    /// all (the bundled git is about to be the only one) both allow the seed,
+    /// and the bundled-tree precondition is dropped for the foreign-first
+    /// case.
     #[test]
-    fn issue1100_seed_gate_vetoes_only_a_foreign_first_git() {
+    fn issue1100_b1_seed_gate_judges_foreign_first_git_by_its_own_helper() {
         let stage = promotion_stage("winuxcmd-1100-seed-gate");
         let bundled = injected_dirs(&stage);
         let sep = path_list_separator();
-        let user_only = stage.user_git_dir.display().to_string();
-        let entries: Vec<&str> = user_only.split(sep).collect();
-        assert!(
-            !credential_seed_allowed(&entries, &bundled),
-            "user git alone on inherited PATH={user_only} must veto the seed"
-        );
         let bundled_first = format!(
             "{}{}{}",
             stage.bundled_bin.display(),
@@ -2880,15 +3085,100 @@ mod path_order_tests {
         );
         let entries: Vec<&str> = bundled_first.split(sep).collect();
         assert!(
-            credential_seed_allowed(&entries, &bundled),
+            credential_seed_allowed(&entries, &bundled, true),
             "bundled git first on inherited PATH={bundled_first} must allow the seed"
         );
         let no_git = stage.other_dir.display().to_string();
         let entries: Vec<&str> = no_git.split(sep).collect();
         assert!(
-            credential_seed_allowed(&entries, &bundled),
-            "no git on inherited PATH={no_git} must allow the seed"
+            credential_seed_allowed(&entries, &bundled, true),
+            "no git on inherited PATH={no_git} with a bundled git must allow the seed"
         );
+        assert!(
+            !credential_seed_allowed(&entries, &bundled, false),
+            "no git on inherited PATH={no_git} and no bundled git must skip the seed"
+        );
+
+        // A Git-for-Windows-shaped foreign install ahead of the bundled dirs.
+        let foreign_root = unique_temp_dir("winuxcmd-1100-foreign-git");
+        let cmd_dir = foreign_root.join("Git").join("cmd");
+        std::fs::create_dir_all(&cmd_dir).unwrap();
+        std::fs::write(cmd_dir.join(git_file_name()), b"user").unwrap();
+        let cmd_path = cmd_dir.display().to_string();
+        let entries: Vec<&str> = cmd_path.split(sep).collect();
+        assert!(
+            credential_seed_allowed(&entries, &bundled, true),
+            "foreign git first with no helper of its own must allow the seed"
+        );
+        assert!(
+            credential_seed_allowed(&entries, &bundled, false),
+            "the foreign-first case must not need a bundled git to allow the seed"
+        );
+        let etc = foreign_root.join("Git").join("etc");
+        std::fs::create_dir_all(&etc).unwrap();
+        std::fs::write(etc.join("gitconfig"), "[credential]\n\thelper = manager\n").unwrap();
+        assert!(
+            !credential_seed_allowed(&entries, &bundled, true),
+            "the foreign install's own system helper must veto the seed"
+        );
+        let _ = std::fs::remove_dir_all(&foreign_root);
+    }
+
+    /// B1 gap (c): the hint gate is exactly "non-tty stdin and a git
+    /// invocation" — a tty session can be prompted, and a session that never
+    /// runs git has nothing to warn about.
+    #[test]
+    fn b1_credential_hint_gate_needs_non_tty_and_a_git_invocation() {
+        assert!(credential_hint_enabled(false, true));
+        assert!(
+            !credential_hint_enabled(true, true),
+            "tty sessions are not hinted"
+        );
+        assert!(!credential_hint_enabled(false, false), "no git, no hint");
+    }
+
+    /// B1 gap (c): the latch makes the hint once per process.
+    #[test]
+    fn b1_hint_latch_is_once_per_process() {
+        let latch = std::sync::atomic::AtomicBool::new(false);
+        assert!(take_hint_latch(&latch), "first take must win");
+        assert!(!take_hint_latch(&latch), "second take must be refused");
+        assert!(!take_hint_latch(&latch));
+    }
+
+    /// B1 gap (c): `git` counts as invoked only as the head of a command
+    /// segment; query faces never count.
+    #[test]
+    fn b1_invocation_detection_finds_git_commands_only() {
+        let args = |raw: &[&str]| raw.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(invocation_args_run_git(&args(&["-c", "git status"])));
+        assert!(invocation_args_run_git(&args(&[
+            "-norc",
+            "-c",
+            "cd repo && git pull"
+        ])));
+        assert!(invocation_args_run_git(&args(&[
+            "-c",
+            "x=$(git rev-parse HEAD)"
+        ])));
+        assert!(invocation_args_run_git(&args(&[
+            "-c",
+            r"C:\Git\cmd\git.exe log"
+        ])));
+        assert!(invocation_args_run_git(&args(&[
+            "-c",
+            r#""C:\Program Files\Git\cmd\git.exe" log"#
+        ])));
+        assert!(invocation_args_run_git(&args(&["-c", "git.exe status"])));
+        assert!(!invocation_args_run_git(&args(&["-c", "echo git is cool"])));
+        assert!(!invocation_args_run_git(&args(&["-c", "echo hello"])));
+        assert!(!invocation_args_run_git(&args(&["--version"])));
+        assert!(!invocation_args_run_git(&args(&["--help"])));
+        assert!(!invocation_args_run_git(&args(&[
+            "--completion-probe",
+            "git ch"
+        ])));
+        assert!(!invocation_args_run_git(&args(&[])));
     }
 
     /// `NIU_USER_PATH_FIRST=0` is the default spelled out: bundled wins.
